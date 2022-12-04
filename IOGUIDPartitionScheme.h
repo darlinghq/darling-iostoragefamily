@@ -89,6 +89,26 @@ struct gpt_ent
 
 #define GPT_ENT_ATTR_PLATFORM 0x00000001
 
+/*!
+ * @defined kIOGUIDPartitionSchemeUUIDKey
+ * @abstract
+ * A property of IOGUIDPartitionSchemeGUID objects
+ * @discussion
+ * The kIOGUIDPartitionSchemeUUIDKey property has an OSString value and contains
+ * a persistent GUID for the disk define in GPT header
+ */
+#define kIOGUIDPartitionSchemeUUIDKey	"UUID"
+
+/*!
+ * @defined kIOMediaGPTPartitionAttributesKey
+ * @abstrat
+ * A property of IOMedia objects for GPT partitions
+ * @discussion
+ * The kIOMediaGPTPartitionAttributesKey property has an OSNumber value of 64bit
+ * GPT partition attributes
+ */
+#define kIOMediaGPTPartitionAttributesKey "GPT Attributes"
+
 #pragma pack(pop)                        /* (reset to default struct packing) */
 
 #ifdef KERNEL
@@ -104,7 +124,7 @@ struct gpt_ent
  * Class
  */
 
-class IOGUIDPartitionScheme : public IOPartitionScheme
+class __exported IOGUIDPartitionScheme : public IOPartitionScheme
 {
     OSDeclareDefaultStructors(IOGUIDPartitionScheme);
 
@@ -120,6 +140,20 @@ protected:
      */
 
     virtual void free(void) APPLE_KEXT_OVERRIDE;
+
+    /*!
+     * @function handleClose
+     * @discussion
+     * The handleClose method closes the client's access to this object.
+     *
+     * This implementation replaces the IOService definition of handleClose().
+     * @param client
+     * Client requesting the close.
+     * @param options
+     * Options for the close.  Set to zero.
+     */
+
+    virtual void handleClose(IOService * client, IOOptionBits options) APPLE_KEXT_OVERRIDE;
 
     /*
      * Scan the provider media for a GUID partition map.    Returns the set
@@ -200,6 +234,14 @@ public:
      */
 
     virtual IOReturn requestProbe(IOOptionBits options) APPLE_KEXT_OVERRIDE;
+
+    /*
+     * Generic entry point for calls from the provider.  A return value of
+     * kIOReturnSuccess indicates that the message was received, and where
+     * applicable, that it was successful.
+     */
+
+    virtual IOReturn message(UInt32 type, IOService * provider, void * argument) APPLE_KEXT_OVERRIDE;
 
     OSMetaClassDeclareReservedUnused(IOGUIDPartitionScheme,  0);
     OSMetaClassDeclareReservedUnused(IOGUIDPartitionScheme,  1);
