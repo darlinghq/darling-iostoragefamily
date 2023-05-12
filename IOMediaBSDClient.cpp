@@ -31,6 +31,7 @@
 #include <sys/stat.h>                        // (S_ISBLK, ...)
 #include <sys/systm.h>                       // (DEV_BSIZE, ...)
 #include <sys/kdebug.h>                      // (FSDBG_CODE, ...)
+#include <libkern/OSMalloc.h>
 #include <IOKit/assert.h>
 #include <IOKit/IOBSD.h>
 #include <IOKit/IODeviceTreeSupport.h>
@@ -44,9 +45,9 @@
 #include <IOKit/storage/IOMedia.h>
 #include <IOKit/storage/IOMediaBSDClient.h>
 ///w:start
-#if !TARGET_OS_EMBEDDED
+#if TARGET_OS_OSX
 #include <IOKit/pwr_mgt/RootDomain.h>
-#endif /* !TARGET_OS_EMBEDDED */
+#endif /* TARGET_OS_OSX */
 ///w:stop
 
 #define super IOService
@@ -65,6 +66,7 @@ const UInt32 kAnchorsMaxCount    = kMinorsMaxCount;
 #define kMsgNoLocation "%s: No location is found for media \"%s\".\n", getName()
 
 #define MAX_PROVISION_EXTENTS_COUNT (PAGE_SIZE/sizeof(IOStorageProvisionExtent))
+#define MAX_UNMAP_EXTENTS_COUNT     8
 
 extern "C"
 {
@@ -183,12 +185,12 @@ struct MinorSlot
     void *             cdevNode;      // (character device's devfs node)
     UInt32             cdevOpen;      // (character device's open count)
     IOStorageAccess    cdevOpenLevel; // (character device's open level)
-#if TARGET_OS_EMBEDDED
+#if !TARGET_OS_OSX
     IOStorageOptions   cdevOptions;
-#endif /* TARGET_OS_EMBEDDED */
+#endif /* !TARGET_OS_OSX */
 };
 
-class MinorTable
+class __exported MinorTable
 {
 protected:
     class
@@ -243,12 +245,13 @@ protected:
     IOLock *      _openLock;          // (lock for opens, closes)
     IOLock *      _stateLock;         // (lock for state, tables)
 ///w:start
-#if !TARGET_OS_EMBEDDED
+#if TARGET_OS_OSX
     thread_call_t         _assertionCall;
     IOPMDriverAssertionID _assertionID;
     IOLock *              _assertionLock;
     AbsoluteTime          _assertionTime;
-#endif /* !TARGET_OS_EMBEDDED */
+#endif /* TARGET_OS_OSX */
+    OSMallocTag           _iostorageMallocTag;
 ///w:stop
 
 public:
@@ -269,7 +272,7 @@ public:
     void          lockState();
     void          unlockState();
 ///w:start
-#if !TARGET_OS_EMBEDDED
+#if TARGET_OS_OSX
     thread_call_t         getAssertionCall();
 
     IOPMDriverAssertionID getAssertionID();
@@ -280,7 +283,8 @@ public:
 
     void                  lockAssertion();
     void                  unlockAssertion();
-#endif /* !TARGET_OS_EMBEDDED */
+#endif /* TARGET_OS_OSX */
+    OSMallocTag           getIOStorageMallocTag();
 ///w:stop
 };
 
@@ -323,7 +327,12 @@ bool IOMediaBSDClient::start(IOService * provider)
     // This method is called once we have been attached to the provider object.
     //
 
-    IOMedia * media = (IOMedia *) provider;
+    IOMedia * media = (IOMedia *) OSDynamicCast(IOMedia, provider);
+
+    //
+    // validate provider is IOMedia
+    //
+    if ( media == NULL ) return false;
 
     // Ask our superclass' opinion.
 
@@ -948,6 +957,8 @@ int dkopen(dev_t dev, int flags, int devtype, proc_t /* proc */)
     error = 0;
     media = 0;
     minor = gIOMediaBSDClientGlobals.getMinor(getminor(dev));
+    level = kIOStorageAccessInvalid;
+    levelOut = kIOStorageAccessInvalid;
 
     //
     // Process the open.
@@ -1102,9 +1113,9 @@ int dkclose(dev_t dev, int /* flags */, int devtype, proc_t /* proc */)
     {
         minor->cdevOpen      = 0;
         minor->cdevOpenLevel = kIOStorageAccessNone;
-#if TARGET_OS_EMBEDDED
+#if !TARGET_OS_OSX
         minor->cdevOptions   = 0;
-#endif /* TARGET_OS_EMBEDDED */
+#endif /* !TARGET_OS_OSX */
     }
 
     levelOut = DK_ADD_ACCESS(minor->bdevOpenLevel, minor->cdevOpenLevel);
@@ -1273,7 +1284,7 @@ int dkioctl(dev_t dev, u_long cmd, caddr_t data, int flags, proc_t proc)
                 *(uint64_t *)data = 0;
 
         } break;
-
+            
         case DKIOCGETMAXBLOCKCOUNTREAD:                          // (uint64_t *)
         {
             //
@@ -1839,11 +1850,19 @@ int dkioctl(dev_t dev, u_long cmd, caddr_t data, int flags, proc_t proc)
             // This ioctl asks that the media object delete unused data.
             //
 
+            // Dynamic allocation
             IOStorageExtent * extents;
+            
+            // Stack allocation
+            IOStorageExtent   extentsArray [ MAX_UNMAP_EXTENTS_COUNT ];
+            
+            uint32_t          extentsNumBytesTotal  = 0;
+            uint32_t          extentsNumBytesLoop   = 0;
             dk_unmap_64_t     request;
             dk_unmap_32_t *   request32;
             dk_unmap_64_t *   request64;
             IOReturn          status;
+            OSMallocTag       iostorageTag          = gIOMediaBSDClientGlobals.getIOStorageMallocTag();
 
             assert(sizeof(dk_extent_t) == sizeof(IOStorageExtent));
 
@@ -1868,47 +1887,112 @@ int dkioctl(dev_t dev, u_long cmd, caddr_t data, int flags, proc_t proc)
             // Delete unused data from the media.
 
             if ( request.extents == 0 )  { error = EINVAL;  break; }
-
-            extents = IONew(IOStorageExtent, request.extentsCount);
-
-            if ( extents == 0 )  { error = ENOMEM;  break; }
-
-            if ( proc == kernproc )
+            
+            // Calculate number of bytes to allocate.
+            // Check unsigned wraparound
+            
+            if ( request.extentsCount > UINT32_MAX / ( uint32_t ) sizeof ( IOStorageExtent ) )
             {
-                bcopy( /* src */ (void *) request.extents,
-                       /* dst */ extents,
-                       /* n   */ request.extentsCount * sizeof(IOStorageExtent) );
+                error = EOVERFLOW;
+                break;
             }
             else
             {
-                error = copyin( /* uaddr */ request.extents,
-                                /* kaddr */ extents,
-                                /* len   */ request.extentsCount * sizeof(IOStorageExtent) );
+                extentsNumBytesTotal = ( uint32_t ) ( request.extentsCount * sizeof ( IOStorageExtent ) );
             }
+            
+            // Set extents to the stack allocated array initially.
+            extents             = extentsArray;
+            extentsNumBytesLoop = extentsNumBytesTotal;
 
-            if ( error == 0 )
+            if ( request.extentsCount > MAX_UNMAP_EXTENTS_COUNT )
             {
+            
+                // Attempt to allocate the extents.
+                extents = ( IOStorageExtent * ) OSMalloc_noblock ( extentsNumBytesTotal, iostorageTag );
 
-                if ( kdebug_enable )
+                if ( extents == 0 )
                 {
-                    uint32_t        i;
-
-                    for ( i = 0; i < request.extentsCount; i++ )
-                    {
-                        KERNEL_DEBUG_CONSTANT(FSDBG_CODE(DBG_IOCTL, 1) | DBG_FUNC_NONE, dev,
-                            extents[i].byteStart / minor->bdevBlockSize, extents[i].byteCount, 0, 0);
-                    }
+                    
+                    // Set back to the stack allocated array. We will send multiple unmaps
+                    // down to the device driver. We set the "loop bytes" to be equal to the
+                    // size of our stack allocated array (or the size of the extents passed in).
+                    extents = extentsArray;
+                    extentsNumBytesLoop = MAX_UNMAP_EXTENTS_COUNT * sizeof ( IOStorageExtent );
 
                 }
-                status = minor->media->unmap( /* client       */ minor->client,
-                                              /* extents      */ extents,
-                                              /* extentsCount */ request.extentsCount,
-                                              /* options      */ request.options );
+                
+            }
+                
+            while ( extentsNumBytesTotal > 0 )
+            {
+                
+                uint32_t extentsCount = extentsNumBytesLoop / sizeof ( IOStorageExtent );
+                
+                // bzero the trim extents for good measure.
+                bzero ( extents, extentsNumBytesLoop );
+                
+                if ( proc == kernproc )
+                {
+                    bcopy( /* src */ (void *) request.extents,
+                          /* dst */ extents,
+                          /* n   */ extentsNumBytesLoop );
+                }
+                else
+                {
+                    error = copyin( /* uaddr */ request.extents,
+                                   /* kaddr */ extents,
+                                   /* len   */ extentsNumBytesLoop );
+                }
+                
+                if ( error == 0 )
+                {
+                    
+                    if ( kdebug_enable )
+                    {
+                        
+                        uint32_t        i;
+                        
+                        for ( i = 0; i < extentsCount; i++ )
+                        {
+                            KERNEL_DEBUG_CONSTANT(FSDBG_CODE(DBG_IOCTL, 1) | DBG_FUNC_NONE, dev,
+                                                  extents[i].byteStart / minor->bdevBlockSize, extents[i].byteCount, 0, 0);
+                        }
+                        
+                    }
+                    status = minor->media->unmap( /* client       */ minor->client,
+                                                 /* extents      */ extents,
+                                                 /* extentsCount */ extentsCount,
+                                                 /* options      */ request.options );
+                    
+                    error = minor->media->errnoFromReturn(status);
+                    if ( error )
+                    {
+                        break;
+                    }
+                    
+                }
+                else
+                {
+                    // Couldn't copyin.
+                    break;
+                }
 
-                error = minor->media->errnoFromReturn(status);
+                // Recalculate total extents left
+                extentsNumBytesTotal -= extentsNumBytesLoop;
+                
+                // Increment extents pointer by "processed" extents
+                request.extents += extentsNumBytesLoop;
+                
+                // Set loop counter to correct value for next iteration
+                extentsNumBytesLoop = min ( extentsNumBytesLoop, extentsNumBytesTotal );
+                
             }
 
-            IODelete(extents, IOStorageExtent, request.extentsCount);
+            if ( extents != extentsArray )
+            {
+                OSFree ( ( void * ) extents, request.extentsCount * sizeof ( IOStorageExtent ), iostorageTag );
+            }
 
         } break;
 
@@ -2023,6 +2107,31 @@ int dkioctl(dev_t dev, u_long cmd, caddr_t data, int flags, proc_t proc)
                 strlcpy(p, strchr(p, ':') + 1, l);     // (strip the plane name)
             else
                 error = EINVAL;
+
+        } break;
+
+        case DKIOCGETERRORDESCRIPTION:                     // (dk_error_description_t *)
+        {
+            //
+            // This ioctl returns a string describing errors
+            //
+#define kNVMeFatalErrorCodeKey                "Fatal Error Code"
+#define kIOSATAQueueManagerTerminateReasonKey  "Terminate Reason"
+
+            size_t l = ((dk_error_description_t *)data)->description_size;
+            char * p = ((dk_error_description_t *)data)->description;
+            OSObject  * obj;
+            OSString  * str;
+
+            obj = minor->media->copyProperty(kNVMeFatalErrorCodeKey, gIOServicePlane);
+            if (!obj)
+                obj = minor->media->copyProperty(kIOSATAQueueManagerTerminateReasonKey, gIOServicePlane);
+            if ((str = OSDynamicCast(OSString, obj)))
+                strlcpy(p, str->getCStringNoCopy(), l);
+            else
+                error = EINVAL;
+
+            OSSafeReleaseNULL(obj);
 
         } break;
 
@@ -2214,6 +2323,90 @@ int dkioctl(dev_t dev, u_long cmd, caddr_t data, int flags, proc_t proc)
                 *(uint32_t *)data = 0;
             
         } break;
+            
+        case DKIOCGETLOCATION:                                     // (uint64_t *)
+        {
+            
+            //
+            // This ioctl returns the physical location of the device ( internal / external ).
+            //
+            
+            // This ioctl was added to help the kernel differentiate between I/O to/from internal
+            // and external storage in an effort to better monitor NAND usage. This ioctl is reliant
+            // upon storage controller drivers providing information that is accurate. Therefore the
+            // result of this ioctl should be considered a "best effort" and should NOT be relied
+            // upon for making critical decisions.
+            
+            // We default to the storage being considered internal.
+            *(uint64_t *)data = 0;
+            
+            // First we look for a Protocol Characteristics dictionary. First party storage controller
+            // drivers should publish one.
+            OSDictionary * dictionary = OSDynamicCast(
+                            /* class  */ OSDictionary,
+                            /* object */ minor->media->getProperty(
+                                    /* key   */ kIOPropertyProtocolCharacteristicsKey,
+                                    /* plane */ gIOServicePlane ) );
+
+            if ( dictionary )
+            {
+                
+                // We have a Protocol Characteristics dictionary. Check for the Physical Interconnect
+                // Location property.
+                OSString * string = OSDynamicCast(
+                         /* class  */ OSString,
+                         /* object */ dictionary->getObject(
+                                 /* key   */ kIOPropertyPhysicalInterconnectLocationKey ) );
+                
+                if ( string && string->isEqualTo(kIOPropertyExternalKey) )
+                {
+                    *(uint64_t *)data = DK_LOCATION_EXTERNAL;
+                }
+                
+            }
+            
+            else
+            {
+                
+                // We couldn't find a Protocol Characteristics dictionary. Look for a Physical Interconnect
+                // Location property.
+                OSString * string = OSDynamicCast(
+                         /* class  */ OSString,
+                         /* object */ minor->media->getProperty(
+                                 /* key   */ kIOPropertyPhysicalInterconnectLocationKey,
+                                 /* plane */ gIOServicePlane ) );
+                
+                if ( string && string->isEqualTo(kIOPropertyExternalKey) )
+                {
+                    *(uint64_t *)data = DK_LOCATION_EXTERNAL;
+                }
+                
+            }
+            
+        } break;
+
+///w:start
+#if defined(DKIOCGETMAXSWAPWRITE) && defined(kIOMaximumSwapWriteKey)
+///w:stop
+        case DKIOCGETMAXSWAPWRITE:                              // (uint64_t *)
+        {
+            //
+            // get maximum swap file write per day in bytes
+            //
+
+            OSNumber * number = OSDynamicCast(
+                         /* class  */ OSNumber,
+                         /* object */ minor->media->getProperty(
+                                 /* key   */ kIOMaximumSwapWriteKey,
+                                 /* plane */ gIOServicePlane ) );
+            if ( number )
+                *(uint64_t *)data = number->unsigned64BitValue();
+            else
+                *(uint64_t *)data = 0;
+        } break;
+///w:start
+#endif //DKIOCGETMAXSWAPWRITE
+///w:stop
 
         default:
         {
@@ -2460,13 +2653,13 @@ int dkioctl_cdev(dev_t dev, u_long cmd, caddr_t data, int flags, proc_t proc)
 
     switch ( cmd )
     {
-#if TARGET_OS_EMBEDDED
+#if !TARGET_OS_OSX
         case _DKIOCSETSTATIC:                                          // (void)
         {
             minor->cdevOptions |= kIOStorageOptionIsStatic;
 
         } break;
-#endif /* TARGET_OS_EMBEDDED */
+#endif /* !TARGET_OS_OSX */
 
         default:
         {
@@ -2578,16 +2771,13 @@ inline void DKR_SET_BYTE_COUNT(dkr_t dkr, dkrtype_t dkrtype, UInt64 bcount)
         uio_setresid(((dio_t)dkr)->uio, uio_resid(((dio_t)dkr)->uio) - bcount);
 }
 
-inline void DKR_RUN_COMPLETION(dkr_t dkr, dkrtype_t dkrtype, IOReturn status)
+inline void DKR_RUN_COMPLETION(dkr_t dkr, dkrtype_t dkrtype, int error)
 {
     if (dkrtype == DKRTYPE_BUF)
     {
         buf_t       bp = (buf_t)dkr;
-        MinorSlot * minor;
 
-        minor = gIOMediaBSDClientGlobals.getMinor(getminor(buf_device(bp)));
-
-        buf_seterror(bp, minor->media->errnoFromReturn(status));     // (error?)
+        buf_seterror(bp, error);                           // (error?)
         buf_biodone(bp);                                   // (complete request)
     }
 }
@@ -2673,7 +2863,7 @@ inline IOStorageAttributes DKR_GET_ATTRIBUTES(dkr_t dkr, dkrtype_t dkrtype)
 
         attributes.priority = DK_TIER_TO_PRIORITY(bufattr_throttled(attributes.bufattr));
     }
-#if TARGET_OS_EMBEDDED
+#if !TARGET_OS_OSX
     else
     {
         dev_t       dev = ((dio_t)dkr)->dev;
@@ -2683,19 +2873,19 @@ inline IOStorageAttributes DKR_GET_ATTRIBUTES(dkr_t dkr, dkrtype_t dkrtype)
 
         attributes.options |= minor->cdevOptions;
     }
-#endif /* TARGET_OS_EMBEDDED */
+#endif /* !TARGET_OS_OSX */
 
     return attributes;
 }
 ///w:start
-#if !TARGET_OS_EMBEDDED
+#if TARGET_OS_OSX
 inline bool DKR_DELAY_IDLE_SLEEP(dkr_t dkr, dkrtype_t dkrtype)
 {
     return (dkrtype == DKRTYPE_BUF)
            ? bufattr_delayidlesleep(buf_attr((buf_t)dkr))
            : false;
 }
-#endif /* !TARGET_OS_EMBEDDED */
+#endif /* TARGET_OS_OSX */
 ///w:stop
 
 int dkreadwrite(dkr_t dkr, dkrtype_t dkrtype)
@@ -2718,8 +2908,8 @@ int dkreadwrite(dkr_t dkr, dkrtype_t dkrtype)
 
     if ( ( minor == NULL ) || ( minor->isOrphaned ) )                             // (is minor in flux?)
     {
-        status = kIOReturnNoMedia;
-        goto dkreadwriteErr;
+        DKR_RUN_COMPLETION(dkr, dkrtype, ENXIO);      // DKR_RUN_COMPLETION is a NO-OP on synchronous IO
+        return ENXIO;
     }
 
     if ( minor->media->isFormatted() == false )       // (is media unformatted?)
@@ -2822,7 +3012,7 @@ int dkreadwrite(dkr_t dkr, dkrtype_t dkrtype)
     DKR_SET_DRIVER_DATA(dkr, dkrtype, buffer);
 
 ///w:start
-#if !TARGET_OS_EMBEDDED
+#if TARGET_OS_OSX
     if ( DKR_DELAY_IDLE_SLEEP(dkr, dkrtype) )
     {
         IOPMDriverAssertionID assertionID;
@@ -2856,7 +3046,7 @@ int dkreadwrite(dkr_t dkr, dkrtype_t dkrtype)
 
         gIOMediaBSDClientGlobals.unlockAssertion();
     }
-#endif /* !TARGET_OS_EMBEDDED */
+#endif /* TARGET_OS_OSX */
 ///w:stop
     if ( DKR_IS_ASYNCHRONOUS(dkr, dkrtype) )       // (an asynchronous request?)
     {
@@ -2945,14 +3135,22 @@ void dkreadwritecompletion( void *   target,
     {
         if ( status != kIOReturnNotPermitted )
         {
-            IOLog("%s: %s.\n", minor->name, minor->media->stringFromReturn(status));
+            if ( minor != NULL )
+            {
+                IOLog("%s: %s.\n", minor->name, minor->media->stringFromReturn(status));
+            }
+            else
+            {
+                IOLog("minor not available for device %x: %x.\n", dev, status);
+            }
         }
     }
 
     if ( DKR_IS_ASYNCHRONOUS(dkr, dkrtype) )       // (an asynchronous request?)
     {
         DKR_SET_BYTE_COUNT(dkr, dkrtype, actualByteCount);   // (set byte count)
-        DKR_RUN_COMPLETION(dkr, dkrtype, status);            // (run completion)
+        DKR_RUN_COMPLETION(dkr, dkrtype,
+            ((minor != NULL) ? minor->media->errnoFromReturn(status) : ENXIO));   // (run completion)
     }
     else
     {
@@ -2960,7 +3158,7 @@ void dkreadwritecompletion( void *   target,
     }
 }
 ///w:start
-#if !TARGET_OS_EMBEDDED
+#if TARGET_OS_OSX
 void dkreadwriteassertion(thread_call_param_t param0, thread_call_param_t param1)
 {
     AbsoluteTime assertionTime;
@@ -2988,7 +3186,7 @@ void dkreadwriteassertion(thread_call_param_t param0, thread_call_param_t param1
 
     gIOMediaBSDClientGlobals.unlockAssertion();
 }
-#endif /* !TARGET_OS_EMBEDDED */
+#endif /* TARGET_OS_OSX */
 ///w:stop
 
 // =============================================================================
@@ -3353,20 +3551,30 @@ UInt32 MinorTable::insert( IOMedia *          media,
 
     // Create a block and character device node in BSD for this media.
 
+    const char *owner_keys[3] = {"owner-uid", "owner-gid", "owner-mode"};
+    int owner_id_mode[3] = {UID_ROOT, GID_OPERATOR, 0640};
+    int i;
+
+    for (i=0; i<3; i++)
+    {
+        OSNumber *_num = OSDynamicCast(OSNumber, media->getProperty(owner_keys[i], gIOServicePlane));
+        if (_num) owner_id_mode[i]  = _num->unsigned32BitValue();
+    }
+
     bdevNode = devfs_make_node( /* dev        */ makedev(majorID, minorID),
                                 /* type       */ DEVFS_BLOCK, 
-                                /* owner      */ UID_ROOT,
-                                /* group      */ GID_OPERATOR,
-                                /* permission */ 0640,
+                                /* owner      */ owner_id_mode[0],
+                                /* group      */ owner_id_mode[1],
+                                /* permission */ owner_id_mode[2],
                                 /* name (fmt) */ "disk%d%s",
                                 /* name (arg) */ anchorID,
                                 /* name (arg) */ slicePath );
 
     cdevNode = devfs_make_node( /* dev        */ makedev(majorID, minorID),
                                 /* type       */ DEVFS_CHAR, 
-                                /* owner      */ UID_ROOT,
-                                /* group      */ GID_OPERATOR,
-                                /* permission */ 0640,
+                                /* owner      */ owner_id_mode[0],
+                                /* group      */ owner_id_mode[1],
+                                /* permission */ owner_id_mode[2],
                                 /* name (fmt) */ "rdisk%d%s",
                                 /* name (arg) */ anchorID,
                                 /* name (arg) */ slicePath );
@@ -3403,9 +3611,9 @@ UInt32 MinorTable::insert( IOMedia *          media,
     _table[minorID].cdevNode      = cdevNode;
     _table[minorID].cdevOpen      = 0;
     _table[minorID].cdevOpenLevel = kIOStorageAccessNone;
-#if TARGET_OS_EMBEDDED
+#if !TARGET_OS_OSX
     _table[minorID].cdevOptions   = 0;
-#endif /* TARGET_OS_EMBEDDED */
+#endif /* !TARGET_OS_OSX */
 
     _table[minorID].client->retain();              // (retain client)
     _table[minorID].media->retain();               // (retain media)
@@ -3703,11 +3911,13 @@ IOMediaBSDClientGlobals::IOMediaBSDClientGlobals()
     _openLock  = IOLockAlloc();
     _stateLock = IOLockAlloc();
 ///w:start
-#if !TARGET_OS_EMBEDDED
+#if TARGET_OS_OSX
     _assertionCall = thread_call_allocate(dkreadwriteassertion, NULL);
     _assertionID   = kIOPMUndefinedDriverAssertionID;
     _assertionLock = IOLockAlloc();
-#endif /* !TARGET_OS_EMBEDDED */
+#endif /* TARGET_OS_OSX */
+    // Alloc tag before bdevsw and cdevsw hook-ups.
+    _iostorageMallocTag = OSMalloc_Tagalloc ( "com.apple.iokit.iostoragefamily", 0 );
 ///w:stop
 }
 
@@ -3718,10 +3928,10 @@ IOMediaBSDClientGlobals::~IOMediaBSDClientGlobals()
     //
 
 ///w:start
-#if !TARGET_OS_EMBEDDED
+#if TARGET_OS_OSX
     if ( _assertionCall )               thread_call_free(_assertionCall);
     if ( _assertionLock )               IOLockFree(_assertionLock);
-#endif /* !TARGET_OS_EMBEDDED */
+#endif /* TARGET_OS_OSX */
 ///w:stop
     if ( _openLock )                    IOLockFree(_openLock);
     if ( _stateLock )                   IOLockFree(_stateLock);
@@ -3730,6 +3940,8 @@ IOMediaBSDClientGlobals::~IOMediaBSDClientGlobals()
 
     if ( _minors )                      delete _minors;
     if ( _anchors )                     delete _anchors;
+    if ( _iostorageMallocTag )          OSMalloc_Tagfree(_iostorageMallocTag);
+    _iostorageMallocTag = NULL;
 }
 
 AnchorTable * IOMediaBSDClientGlobals::getAnchors()
@@ -3778,13 +3990,14 @@ bool IOMediaBSDClientGlobals::isValid()
            ( _minors                     ) &&
            ( _majorID != kInvalidMajorID ) &&
 ///w:start
-#if !TARGET_OS_EMBEDDED
+#if TARGET_OS_OSX
            ( _assertionCall              ) &&
            ( _assertionLock              ) &&
-#endif /* !TARGET_OS_EMBEDDED */
+#endif /* TARGET_OS_OSX */
 ///w:stop
            ( _openLock                   ) &&
-           ( _stateLock                  );
+           ( _stateLock                  ) &&
+           ( _iostorageMallocTag         );
 }
 
 void IOMediaBSDClientGlobals::lockOpen()
@@ -3822,8 +4035,13 @@ void IOMediaBSDClientGlobals::unlockState()
 
     IOLockUnlock(_stateLock);
 }
+
+OSMallocTag IOMediaBSDClientGlobals::getIOStorageMallocTag()
+{
+    return _iostorageMallocTag;
+}
 ///w:start
-#if !TARGET_OS_EMBEDDED
+#if TARGET_OS_OSX
 thread_call_t IOMediaBSDClientGlobals::getAssertionCall()
 {
     return _assertionCall;
@@ -3858,5 +4076,5 @@ void IOMediaBSDClientGlobals::unlockAssertion()
 {
     IOLockUnlock(_assertionLock);
 }
-#endif /* !TARGET_OS_EMBEDDED */
+#endif /* TARGET_OS_OSX */
 ///w:stop

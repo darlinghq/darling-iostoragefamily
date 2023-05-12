@@ -21,70 +21,88 @@
  * @APPLE_LICENSE_HEADER_END@
  */
 
+#define IOLOCKS_INLINE
+
 #include <IOKit/assert.h>
 #include <IOKit/IOLib.h>
 #include <IOKit/storage/IOStorage.h>
+#include <IOKit/IOLocks.h>
 
 #define super IOService
 OSDefineMetaClassAndAbstractStructors(IOStorage, IOService)
 
-#if TARGET_OS_OSX && defined(__x86_64__)
+#if TARGET_OS_OSX
 #define kIOStorageSynchronizeOptionsUnsupported ( ( IOStorage::ExpansionData * ) 1 )
 
+#if defined(__x86_64__) || defined(__i386__)
 extern "C" void _ZN9IOStorage16synchronizeCacheEP9IOService( IOStorage *, IOService * );
 extern "C" void _ZN9IOStorage11synchronizeEP9IOServiceyyj( IOStorage *, IOService *, UInt64, UInt64, IOStorageSynchronizeOptions );
 
-#define storageSynchronizeOptions( storage ) ( ( OSMemberFunctionCast( void *, storage, ( void ( IOStorage::* )( IOService *                                              ) ) &IOStorage::synchronizeCache ) == _ZN9IOStorage16synchronizeCacheEP9IOService ) && \
-                                               ( OSMemberFunctionCast( void *, storage, ( void ( IOStorage::* )( IOService *, UInt64, UInt64, IOStorageSynchronizeOptions ) ) &IOStorage::synchronize      ) != _ZN9IOStorage11synchronizeEP9IOServiceyyj   ) )
-#endif /* TARGET_OS_OSX && defined(__x86_64__) */
+#define storageSynchronizeOptions( storage ) ( ( OSMemberFunctionCast( void *, storage, &IOStorage::synchronizeCache ) == _ZN9IOStorage16synchronizeCacheEP9IOService ) && \
+                                               ( OSMemberFunctionCast( void *, storage, &IOStorage::synchronize      ) != _ZN9IOStorage11synchronizeEP9IOServiceyyj   ) )
+
+#else
+
+#define storageSynchronizeOptions( storage ) (1)
+
+#endif
+#endif /* TARGET_OS_OSX */
 
 class IOStorageSyncerLock
 {
 protected:
 
-    IOLock * _lock;
+    IOSimpleLock _lock;
 
 public:
 
     inline IOStorageSyncerLock( )
     {
-        _lock = IOLockAlloc( );
+        IOSimpleLockInit( &_lock );
     }
 
     inline ~IOStorageSyncerLock( )
     {
-        if ( _lock ) IOLockFree( _lock );
+        IOSimpleLockDestroy( &_lock );
     }
 
     inline void lock( )
     {
-        IOLockLock( _lock );
+        IOSimpleLockLock( &_lock );
     }
 
     inline void unlock( )
     {
-        IOLockUnlock( _lock );
+        IOSimpleLockUnlock( &_lock );
     }
 
     inline void sleep( void * event )
     {
-        IOLockSleep( _lock, event, THREAD_UNINT );
+        wait_result_t ret = assert_wait( ( event_t ) event, false );
+        
+        unlock( );
+        
+        if( ret == THREAD_WAITING )
+        {
+            thread_block( THREAD_CONTINUE_NULL );
+        }
+        
+        lock( );
     }
 
     inline void wakeup( void * event )
     {
-        IOLockWakeup( _lock, event, false );
+        thread_wakeup( event );
     }
 };
-
-static IOStorageSyncerLock gIOStorageSyncerLock;
 
 class IOStorageSyncer
 {
 protected:
 
-    IOReturn _status;
-    bool     _wakeup;
+    IOReturn            _status;
+    bool                _wakeup;
+    IOStorageSyncerLock _syncerLock;
 
 public:
 
@@ -95,14 +113,14 @@ public:
 
     IOReturn wait( )
     {
-        gIOStorageSyncerLock.lock( );
+        _syncerLock.lock( );
 
         while ( _wakeup == false )
         {
-            gIOStorageSyncerLock.sleep( this );
+            _syncerLock.sleep( ( void * )this );
         }
 
-        gIOStorageSyncerLock.unlock( );
+        _syncerLock.unlock( );
 
         return _status;
     }
@@ -111,13 +129,13 @@ public:
     {
         _status = status;
 
-        gIOStorageSyncerLock.lock( );
+        _syncerLock.lock( );
 
         _wakeup = true;
 
-        gIOStorageSyncerLock.wakeup( this );
-
-        gIOStorageSyncerLock.unlock( );
+        _syncerLock.unlock( );
+        
+        _syncerLock.wakeup( ( void * )this );
     }
 };
 
@@ -134,7 +152,7 @@ static void storageCompletion(void *   target,
     ((IOStorageSyncer *)target)->signal(status);
 }
 
-#if TARGET_OS_OSX && defined(__x86_64__)
+#if TARGET_OS_OSX
 bool IOStorage::attach(IOService * provider)
 {
     if ( super::attach( provider ) == false )
@@ -170,7 +188,7 @@ bool IOStorage::attach(IOService * provider)
 
     return true;
 }
-#endif /* TARGET_OS_OSX && defined(__x86_64__) */
+#endif /* TARGET_OS_OSX */
 
 void IOStorage::complete(IOStorageCompletion * completion,
                          IOReturn              status,
@@ -260,7 +278,7 @@ IOReturn IOStorage::write(IOService *           client,
     return syncer.wait();
 }
 
-#if TARGET_OS_OSX && defined(__x86_64__)
+#if TARGET_OS_OSX
 IOReturn IOStorage::discard(IOService * client,
                             UInt64      byteStart,
                             UInt64      byteCount)
@@ -283,7 +301,7 @@ IOReturn IOStorage::unmap(IOService *           client,
 
     return kIOReturnUnsupported;
 }
-#endif /* TARGET_OS_OSX && defined(__x86_64__) */
+#endif /* TARGET_OS_OSX */
 
 IOReturn
 IOStorage::getProvisionStatus(IOService *                       client,
@@ -342,7 +360,7 @@ IOReturn IOStorage::setPriority(IOService *       client,
     return kIOReturnUnsupported;
 }
 
-#if TARGET_OS_OSX && defined(__x86_64__)
+#if TARGET_OS_OSX
 IOReturn IOStorage::synchronizeCache(IOService * client)
 {
     //
@@ -371,7 +389,7 @@ IOReturn IOStorage::synchronize(IOService *                 client,
     /* default the barrier synchronize to full flush */
     return synchronizeCache( client );
 }
-#endif /* TARGET_OS_OSX && defined(__x86_64__) */
+#endif /* TARGET_OS_OSX */
 
 OSMetaClassDefineReservedUsed(IOStorage,  0);
 OSMetaClassDefineReservedUsed(IOStorage,  1);

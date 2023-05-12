@@ -28,6 +28,7 @@
 #include <IOKit/storage/IOGUIDPartitionScheme.h>
 #include <libkern/OSByteOrder.h>
 #include <sys/utfconv.h>
+#include <IOKit/storage/IOBlockStorageDevice.h>
 
 #define super IOPartitionScheme
 OSDefineMetaClassAndStructors(IOGUIDPartitionScheme, IOPartitionScheme);
@@ -99,6 +100,25 @@ void IOGUIDPartitionScheme::free()
     if ( _partitions )  _partitions->release();
 
     super::free();
+}
+
+void IOGUIDPartitionScheme::handleClose(IOService * client, IOOptionBits options)
+{
+    super::handleClose(client, options);
+
+    // if the client has been already removed from the partition table
+    // Now is the time to terminate the IOMedia object:
+    OSObject* obj = client->getProperty(kIOMediaLiveKey);
+    if (obj && OSDynamicCast(OSBoolean, obj))
+    {
+        // if kIOMediaLiveKey is 0 and kIOMediaPartitionIDKey is removed
+        // then it means that this partition has been removed from partition table.
+        if (0 == ((OSBoolean *) obj)->getValue() && NULL == client->getProperty(kIOMediaPartitionIDKey))
+        {
+            client->terminate();
+            detachMediaObjectFromDeviceTree(OSDynamicCast(IOMedia, client));
+        }
+    }
 }
 
 IOService * IOGUIDPartitionScheme::probe(IOService * provider, SInt32 * score)
@@ -381,6 +401,14 @@ OSSet * IOGUIDPartitionScheme::scan(SInt32 * score)
         goto scanErr;
     }
 
+    // publish the GPT disk GUID as an OSString
+    {
+        uuid_string_t uuid;
+        uuid_unswap( headerMap->hdr_uuid );
+        uuid_unparse( headerMap->hdr_uuid, uuid );
+        setProperty( kIOGUIDPartitionSchemeUUIDKey, uuid );
+    }
+
     // Allocate a buffer large enough to hold one map, rounded to a media block.
 
     buffer->release();
@@ -596,6 +624,9 @@ IOMedia * IOGUIDPartitionScheme::instantiateMediaObject( gpt_ent * partition,
             uuid_string_t uuid;
             uuid_unparse(partition->ent_uuid, uuid);
             newMedia->setProperty(kIOMediaUUIDKey, uuid);
+
+            UInt64 gptAttributes = OSSwapLittleToHostInt64( partition->ent_attr );
+            newMedia->setProperty(kIOMediaGPTPartitionAttributesKey, gptAttributes, 64);
         }
         else
         {
@@ -616,6 +647,56 @@ IOMedia * IOGUIDPartitionScheme::instantiateDesiredMediaObject(
     //
 
     return new IOMedia;
+}
+
+IOReturn IOGUIDPartitionScheme::message(UInt32      type,
+                                        IOService * provider,
+                                        void *      argument)
+{
+    //
+    // Generic entry point for calls from the provider.  A return value of
+    // kIOReturnSuccess indicates that the message was received, and where
+    // applicable, that it was successful.
+    //
+
+    switch (type)
+    {
+        case kIOMessageMediaParametersHaveChanged:
+        {
+            OSIterator * partitionIterator;
+
+            partitionIterator = OSCollectionIterator::withCollection(_partitions);
+
+            if ( partitionIterator )
+            {
+                IOMedia *    media          = getProvider();
+                IOMedia *    partition;
+
+                while ( (partition = (IOMedia *) partitionIterator->getNextObject()) )
+                {
+
+                    lockForArbitration();
+
+                    partition->init( partition->getBase(),
+                                     partition->getSize(),
+                                     media->getPreferredBlockSize(),
+                                     media->getAttributes(),
+                                     partition->isWhole(),
+                                     media->isWritable(),
+                                     partition->getContentHint() );
+
+                    unlockForArbitration();
+                }
+
+                partitionIterator->release();
+            }
+            return kIOReturnSuccess;
+        }
+        default:
+        {
+            return super::message(type, provider, argument);
+        }
+    }
 }
 
 OSMetaClassDefineReservedUnused(IOGUIDPartitionScheme,  0);

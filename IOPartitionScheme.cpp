@@ -39,19 +39,6 @@ static SInt32 partitionComparison( const OSMetaClassBase * object1,
     UInt64 base1 = ( ( IOMedia * ) object1 )->getBase( );
     UInt64 base2 = ( ( IOMedia * ) object2 )->getBase( );
 
-#if TARGET_OS_EMBEDDED
-    OSString * uuid1 = OSDynamicCast( OSString, ( ( IOMedia * ) object1 )->getProperty( kIOMediaUUIDKey ) );
-    OSString * uuid2 = OSDynamicCast( OSString, ( ( IOMedia * ) object2 )->getProperty( kIOMediaUUIDKey ) );
-
-    if ( uuid1 || uuid2 )
-    {
-        if ( uuid1 == 0 ) return -1;
-        if ( uuid2 == 0 ) return  1;
-
-        return strcmp( uuid2->getCStringNoCopy( ), uuid1->getCStringNoCopy( ) );
-    }
-#endif /* TARGET_OS_EMBEDDED */
-
     if ( base1 < base2 ) return  1;
     if ( base1 > base2 ) return -1;
 
@@ -331,7 +318,7 @@ IOReturn IOPartitionScheme::synchronize(IOService *                 client,
     // Flush the cached data in the storage object, if any.
     //
 
-#if TARGET_OS_OSX && defined(__x86_64__)
+#if TARGET_OS_OSX
     if ( _respondsTo_synchronizeCache )
     {
         if ( options == _kIOStorageSynchronizeOption_super__synchronizeCache )
@@ -343,7 +330,7 @@ IOReturn IOPartitionScheme::synchronize(IOService *                 client,
             return IOStorage::synchronize( client, byteStart, byteCount, options );
         }
     }
-#endif /* TARGET_OS_OSX && defined(__x86_64__) */
+#endif /* TARGET_OS_OSX */
 
     return getProvider( )->synchronize( this, byteStart, byteCount, options );
 }
@@ -556,48 +543,6 @@ OSSet * IOPartitionScheme::juxtaposeMediaObjects(OSSet * partitionsOld,
         base1 = partition1 ? partition1->getBase( ) : UINT64_MAX;
         base2 = partition2 ? partition2->getBase( ) : UINT64_MAX;
 
-#if TARGET_OS_EMBEDDED
-        if ( partition1 && partition2 )
-        {
-            OSString * uuid1;
-            OSString * uuid2;
-
-            uuid1 = OSDynamicCast( OSString, partition1->getProperty( kIOMediaUUIDKey ) );
-            uuid2 = OSDynamicCast( OSString, partition2->getProperty( kIOMediaUUIDKey ) );
-
-            if ( uuid1 || uuid2 )
-            {
-                if ( uuid1 == 0 )
-                {
-                   base1 = UINT64_MAX;
-                }
-                else if ( uuid2 == 0 )
-                {
-                   base2 = UINT64_MAX;
-                }
-                else
-                {
-                    int compare;
-
-                    compare = strcmp( uuid1->getCStringNoCopy( ), uuid2->getCStringNoCopy( ) );
-
-                    if ( compare > 0 )
-                    {
-                        base1 = UINT64_MAX;
-                    }
-                    else if ( compare < 0 )
-                    {
-                        base2 = UINT64_MAX;
-                    }
-                    else
-                    {
-                        base1 = base2;
-                    }
-                }
-            }
-        }
-#endif /* TARGET_OS_EMBEDDED */
-
         if ( base1 > base2 )
         {
             // A partition was added.
@@ -649,7 +594,7 @@ OSSet * IOPartitionScheme::juxtaposeMediaObjects(OSSet * partitionsOld,
 
             if ( handleIsOpen( partition1 ) == false )
             {
-                partition1->terminate( kIOServiceSynchronous );
+                partition1->terminate( );
 
                 detachMediaObjectFromDeviceTree( partition1 );
             }
@@ -838,9 +783,9 @@ OSMetaClassDefineReservedUnused(IOPartitionScheme, 29);
 OSMetaClassDefineReservedUnused(IOPartitionScheme, 30);
 OSMetaClassDefineReservedUnused(IOPartitionScheme, 31);
 
-#if TARGET_OS_OSX && defined(__x86_64__)
+#if TARGET_OS_OSX
 extern "C" void _ZN17IOPartitionScheme16synchronizeCacheEP9IOService( IOPartitionScheme * scheme, IOService * client )
 {
     scheme->synchronize( client, 0, 0 );
 }
-#endif /* TARGET_OS_OSX && defined(__x86_64__) */
+#endif /* TARGET_OS_OSX */
